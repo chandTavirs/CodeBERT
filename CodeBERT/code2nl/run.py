@@ -48,6 +48,18 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
                     level = logging.INFO)
 logger = logging.getLogger(__name__)
 
+def get_loss(lm_logits, target_ids, target_mask):
+    active_loss = target_mask[..., 1:].ne(0).view(-1) == 1
+    shift_logits = lm_logits[..., :-1, :].contiguous()
+    shift_labels = target_ids[..., 1:].contiguous()
+    # Flatten the tokens
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-1)
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1))[active_loss],
+                    shift_labels.view(-1)[active_loss])
+
+    outputs = loss, loss * active_loss.sum(), active_loss.sum()
+    return outputs
+
 class Example(object):
     """A single training/test example."""
     def __init__(self,
@@ -266,7 +278,8 @@ def main():
                       sos_id=tokenizer.cls_token_id,eos_id=tokenizer.sep_token_id)
 
     elif args.model_type == 'plbart':
-        model = model_class.from_pretrained(args.model_name_or_path, config=config)
+        model = model_class.from_pretrained(args.model_name_or_path)
+        tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, src_lang="python", tgt_lang="en_XX")
 
     if args.load_model_path is not None:
         logger.info("reload model from {}".format(args.load_model_path))
@@ -339,8 +352,9 @@ def main():
                 loss,_,_ = model(source_ids=source_ids,source_mask=source_mask,target_ids=target_ids,target_mask=target_mask)
             elif args.model_type == 'plbart':
                 output = model(input_ids=source_ids, attention_mask=source_mask, decoder_input_ids=target_ids,
-                               decoder_attention_mask=target_mask, labels=target_ids)
-                loss = output.loss
+                               decoder_attention_mask=target_mask)
+                lm_logits = output.logits
+                loss,_,_ = get_loss(lm_logits, target_ids, target_mask)
 
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu.
@@ -395,22 +409,16 @@ def main():
                         if args.model_type == 'roberta':
                             _,loss,num = model(source_ids=source_ids,source_mask=source_mask,
                                                target_ids=target_ids,target_mask=target_mask)
-                            eval_loss += loss.sum().item()
-                            tokens_num += num.sum().item()
-
                         elif args.model_type == 'plbart':
                             output = model(input_ids=source_ids, attention_mask=source_mask,
-                                           decoder_input_ids=target_ids,
-                                           decoder_attention_mask=target_mask, labels=target_ids)
-                            loss = output.loss
-                            active_loss = target_mask[..., 1:].ne(0).view(-1) == 1
-                            active_loss = active_loss.sum()
-                            eval_loss += (loss*active_loss).sum().item()
-                            tokens_num += active_loss.sum().item()
+                                           decoder_input_ids=target_ids, decoder_attention_mask=target_mask)
+                            lm_logits = output.logits
+                            _, loss, num = get_loss(lm_logits, target_ids, target_mask)
 
+                        eval_loss += loss.sum().item()
+                        tokens_num += num.sum().item()
 
-
-                #Pring loss of dev dataset    
+                #Pring loss of dev dataset
                 model.train()
                 eval_loss = eval_loss / tokens_num
                 result = {'eval_ppl': round(np.exp(eval_loss),5),
@@ -465,21 +473,21 @@ def main():
                     with torch.no_grad():
                         if args.model_type == 'roberta':
                             preds = model(source_ids=source_ids,source_mask=source_mask)
+                            for pred in preds:
+                                if args.model_type == 'roberta':
+                                    t = pred[0].cpu().numpy()
+                                    t = list(t)
+                                    if 0 in t:
+                                        t = t[:t.index(0)]
+                                    text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                                    p.append(text)
+                                elif args.model_type == 'plbart':
+                                    t = pred.cpu().numpy()
                         elif args.model_type == 'plbart':
-                            preds = model.generate(source_ids, num_beams=args.beam_size,
-                                                   max_length=args.max_target_length,
-                                                   bos_token_id=tokenizer.cls_token_id,
-                                                   eos_token_id=tokenizer.sep_token_id )
-                            print(tokenizer.batch_decode(preds, skip_special_tokens=True))
-                            print(preds)
-                            print(preds.shape)
-                        for pred in preds:
-                            t=pred[0].cpu().numpy()
-                            t=list(t)
-                            if 0 in t:
-                                t=t[:t.index(0)]
-                            text = tokenizer.decode(t,clean_up_tokenization_spaces=False)
-                            p.append(text)
+                            preds = model.generate(source_ids,decoder_start_token_id=tokenizer.lang_code_to_id["en_XX"])
+                            p.extend(tokenizer.batch_decode(preds, skip_special_tokens=True))
+
+
                 model.train()
                 predictions=[]
                 with open(os.path.join(args.output_dir,"dev.output"),'w') as f, open(os.path.join(args.output_dir,"dev.gold"),'w') as f1:
