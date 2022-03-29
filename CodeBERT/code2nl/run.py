@@ -33,13 +33,15 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from model import Seq2Seq
+from model import Seq2Seq, Seq2SeqPLBart
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-                          RobertaConfig, RobertaModel, RobertaTokenizer)
-MODEL_CLASSES = {'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer)}
+                          RobertaConfig, RobertaModel, RobertaTokenizer,
+                          PLBartConfig, PLBartModel, PLBartTokenizer, PLBartForConditionalGeneration)
+MODEL_CLASSES = {'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer),
+                 'plbart': (PLBartConfig, PLBartForConditionalGeneration , PLBartTokenizer)}
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -255,12 +257,17 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,do_lower_case=args.do_lower_case)
     
     #budild model
-    encoder = model_class.from_pretrained(args.model_name_or_path,config=config)    
-    decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
-    decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
-    model=Seq2Seq(encoder=encoder,decoder=decoder,config=config,
-                  beam_size=args.beam_size,max_length=args.max_target_length,
-                  sos_id=tokenizer.cls_token_id,eos_id=tokenizer.sep_token_id)
+    if args.model_type == 'roberta':
+        encoder = model_class.from_pretrained(args.model_name_or_path,config=config)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
+        decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+        model=Seq2Seq(encoder=encoder,decoder=decoder,config=config,
+                      beam_size=args.beam_size,max_length=args.max_target_length,
+                      sos_id=tokenizer.cls_token_id,eos_id=tokenizer.sep_token_id)
+
+    elif args.model_type == 'plbart':
+        model = model_class.from_pretrained(args.model_name_or_path, config=config)
+
     if args.load_model_path is not None:
         logger.info("reload model from {}".format(args.load_model_path))
         model.load_state_dict(torch.load(args.load_model_path))
@@ -295,7 +302,7 @@ def main():
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size//args.gradient_accumulation_steps)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size//args.gradient_accumulation_steps, num_workers=4)
 
         num_train_optimization_steps =  args.train_steps
 
@@ -328,8 +335,13 @@ def main():
             batch = next(train_dataloader)
             batch = tuple(t.to(device) for t in batch)
             source_ids,source_mask,target_ids,target_mask = batch
-            loss,_,_ = model(source_ids=source_ids,source_mask=source_mask,target_ids=target_ids,target_mask=target_mask)
-            
+            if args.model_type == 'roberta':
+                loss,_,_ = model(source_ids=source_ids,source_mask=source_mask,target_ids=target_ids,target_mask=target_mask)
+            elif args.model_type == 'plbart':
+                output = model(input_ids=source_ids, attention_mask=source_mask, decoder_input_ids=target_ids,
+                               decoder_attention_mask=target_mask, labels=target_ids)
+                loss = output.loss
+
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu.
             if args.gradient_accumulation_steps > 1:
@@ -380,10 +392,24 @@ def main():
                     source_ids,source_mask,target_ids,target_mask = batch                  
 
                     with torch.no_grad():
-                        _,loss,num = model(source_ids=source_ids,source_mask=source_mask,
-                                           target_ids=target_ids,target_mask=target_mask)     
-                    eval_loss += loss.sum().item()
-                    tokens_num += num.sum().item()
+                        if args.model_type == 'roberta':
+                            _,loss,num = model(source_ids=source_ids,source_mask=source_mask,
+                                               target_ids=target_ids,target_mask=target_mask)
+                            eval_loss += loss.sum().item()
+                            tokens_num += num.sum().item()
+
+                        elif args.model_type == 'plbart':
+                            output = model(input_ids=source_ids, attention_mask=source_mask,
+                                           decoder_input_ids=target_ids,
+                                           decoder_attention_mask=target_mask, labels=target_ids)
+                            loss = output.loss
+                            active_loss = target_mask[..., 1:].ne(0).view(-1) == 1
+                            active_loss = active_loss.sum()
+                            eval_loss += (loss*active_loss).sum().item()
+                            tokens_num += active_loss.sum().item()
+
+
+
                 #Pring loss of dev dataset    
                 model.train()
                 eval_loss = eval_loss / tokens_num
@@ -437,7 +463,16 @@ def main():
                     batch = tuple(t.to(device) for t in batch)
                     source_ids,source_mask= batch                  
                     with torch.no_grad():
-                        preds = model(source_ids=source_ids,source_mask=source_mask)  
+                        if args.model_type == 'roberta':
+                            preds = model(source_ids=source_ids,source_mask=source_mask)
+                        elif args.model_type == 'plbart':
+                            preds = model.generate(source_ids, num_beams=args.beam_size,
+                                                   max_length=args.max_target_length,
+                                                   bos_token_id=tokenizer.cls_token_id,
+                                                   eos_token_id=tokenizer.sep_token_id )
+                            print(tokenizer.batch_decode(preds, skip_special_tokens=True))
+                            print(preds)
+                            print(preds.shape)
                         for pred in preds:
                             t=pred[0].cpu().numpy()
                             t=list(t)
